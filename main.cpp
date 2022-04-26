@@ -4,7 +4,6 @@
 
 #ifdef _WIN32
 #include <intrin.h>
-#include <windows.h>
 #else
 #include <x86intrin.h>
 #include <cpuid.h>
@@ -13,15 +12,30 @@
 #include <iostream>
 #include <vector>
 #include <algorithm>
+#include <numeric>
 
 uint64_t rdtscp()
 {	
-	unsigned int dummy;
+	unsigned int dummy = 0;
 	return __rdtscp(&dummy);
 }
 
+double get_tsc_to_ns_factor()
+{
+	uint64_t t1 = rdtscp();
+	std::this_thread::sleep_for(std::chrono::seconds(10));
+	uint64_t t2 = rdtscp();
+
+	return ((double)(t2 - t1) / 1e10);
+}
+
+uint64_t tsc_to_ns(uint64_t ticks, double factor)
+{
+	return (uint64_t)(ticks / factor);
+}
+
 constexpr uint32_t num_treads = 2;
-constexpr uint32_t iterations = (1 << 25);
+constexpr uint32_t iterations = (1 << 24);
 
 using shared_type = volatile std::atomic<uint32_t>;
 
@@ -54,7 +68,7 @@ void emulate_atomic_reads_writes(uint32_t iterations)
 	}
 }
 
-uint64_t benchmark()
+uint64_t benchmark(double factor)
 {
 	uint64_t start, end;
 	uint64_t elapsed_single, elapsed_multithreaded, elapsed_atomic_reads_writes;
@@ -72,19 +86,19 @@ uint64_t benchmark()
 		threads[i].join();
 
 	end = rdtscp();
-	elapsed_multithreaded = end - start;
+	elapsed_multithreaded = tsc_to_ns(end - start, factor);
 
 	// single threaded increments
 	start = rdtscp();
 	increment_single_thread(shared_variable, iterations);
 	end = rdtscp();
-	elapsed_single = end - start;
+	elapsed_single = tsc_to_ns(end - start, factor);
 
 	// emulating N volatile atomic read/writes
 	start = rdtscp();
 	emulate_atomic_reads_writes(iterations);
 	end = rdtscp();
-	elapsed_atomic_reads_writes = end - start;
+	elapsed_atomic_reads_writes = tsc_to_ns(end - start, factor);
 
 	return (elapsed_multithreaded - elapsed_single - elapsed_atomic_reads_writes) / iterations;
 }
@@ -92,14 +106,18 @@ uint64_t benchmark()
 int main()
 {
 	constexpr uint64_t benchmark_iterations = 10;
-	std::vector<uint64_t> results;
+	double factor = get_tsc_to_ns_factor();
 
+	std::vector<uint64_t> results;
 	for (uint64_t i = 0; i < benchmark_iterations; ++i) {
-		results.push_back(benchmark());
+		results.push_back(benchmark(factor));
 	}
 
-	auto median = results.begin() + results.size() / 2;
-	std::nth_element(results.begin(), median, results.end());
+	std::sort(results.begin(), results.end());
 
-	std::cout << "\nThe median is " << results[results.size() / 2] << std::endl;
+	auto Q1 = results.begin() + results.size() / 4;
+	auto Q3 = results.end() - results.size() / 4;
+
+	std::cout << "\nThe Interquartile range is " << *Q3 - *Q1 << std::endl;
+	std::cout << "The Average of Interquartile range is " << std::accumulate(Q1, Q3, 0.0) / (Q3 - Q1) << std::endl;
 }
