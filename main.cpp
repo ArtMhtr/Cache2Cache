@@ -39,7 +39,8 @@ double tsc2ns_factor()
 	s = rdtscp();
 	e = s;
 
-	while (e - s < ticks_to_wait) {
+	while (e - s < ticks_to_wait)
+	{
 		e = rdtscp();
 	}
 
@@ -85,7 +86,7 @@ void benchmark()
 		cache_line.v2.store(0);
 
 		auto t1 = std::thread(threadA, std::ref(cache_line));
-		std::this_thread::sleep_for(0.01s); // just to be sure that thread A has time to cache cache_line
+		std::this_thread::sleep_for(0.01s); // just to be sure that thread A has time to cache
 		auto t2 = std::thread(threadB, std::ref(cache_line), std::ref(samples), std::ref(current_sample));
 
 		t1.join();
