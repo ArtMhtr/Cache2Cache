@@ -13,6 +13,15 @@
 #include <vector>
 #include <algorithm>
 #include <numeric>
+#include <memory>
+
+using namespace std::chrono_literals;
+
+struct alignas(64) CacheLine
+{
+	std::atomic<uint64_t> v1;
+	std::atomic<uint64_t> v2;
+};
 
 uint64_t rdtscp()
 {	
@@ -20,104 +29,74 @@ uint64_t rdtscp()
 	return __rdtscp(&dummy);
 }
 
-double get_tsc_to_ns_factor()
+double tsc2ns_factor()
 {
-	uint64_t t1 = rdtscp();
-	std::this_thread::sleep_for(std::chrono::seconds(10));
-	uint64_t t2 = rdtscp();
+	uint64_t s, e;
+	constexpr double ticks_to_wait = 1e9;
 
-	return ((double)(t2 - t1) / 1e10);
-}
+	auto start = std::chrono::high_resolution_clock::now();
 
-uint64_t tsc_to_ns(uint64_t ticks, double factor)
-{
-	return (uint64_t)(ticks / factor);
-}
+	s = rdtscp();
+	e = s;
 
-constexpr uint32_t num_treads = 2;
-constexpr uint32_t iterations = (1 << 24);
-
-using shared_type = volatile std::atomic<uint32_t>;
-
-void increment_single_thread(shared_type& sum, uint32_t n_iterations)
-{
-	for (uint32_t i = 0; i < n_iterations; i++) {
-		sum += 1;
+	while (e - s < ticks_to_wait) {
+		e = rdtscp();
 	}
+
+	auto end = std::chrono::high_resolution_clock::now();
+	auto nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
+
+	return ticks_to_wait / nanoseconds.count();
 }
 
-volatile std::atomic<uint32_t> atomic_flag; // should be lock-free
-void increment_multithreaded(shared_type& shared_variable, uint32_t iterations, uint32_t thread_id)
+double tsc2ns(uint64_t ticks)
 {
-	for (uint32_t i = 0; i < iterations; i++) {
-		while ((atomic_flag.load(std::memory_order_acquire) % num_treads) != thread_id) {}
-		shared_variable += 1;
-		atomic_flag++;
+	return ticks / tsc2ns_factor();
+}
+
+void threadA(CacheLine& cache_line)
+{
+	while (cache_line.v1.load(std::memory_order_acquire) == 0) {}
+
+	cache_line.v2.store(rdtscp());
+}
+
+void threadB(CacheLine& cache_line, std::vector<uint64_t>& samples, uint64_t& current_sample)
+{
+	cache_line.v1.store(rdtscp());
+
+	while (cache_line.v2.load(std::memory_order_acquire) == 0) {}
+	samples[current_sample++] = (cache_line.v2.load() - cache_line.v1.load()) / 2;
+}
+
+void benchmark()
+{
+	constexpr uint64_t n_samples = 500;
+
+	std::vector<uint64_t> samples;
+	samples.resize(n_samples);
+
+	CacheLine cache_line;
+	uint64_t current_sample = 0;
+
+	for (size_t i = 0; i < samples.size(); ++i)
+	{
+		cache_line.v1.store(0);
+		cache_line.v2.store(0);
+
+		auto t1 = std::thread(threadA, std::ref(cache_line));
+		std::this_thread::sleep_for(0.01s); // just to be sure that thread A has time to cache cache_line
+		auto t2 = std::thread(threadB, std::ref(cache_line), std::ref(samples), std::ref(current_sample));
+
+		t1.join();
+		t2.join();
 	}
-}
 
-#define UNUSED(x) ((void)(x))
-void emulate_atomic_reads_writes(uint32_t iterations)
-{
-	for (size_t i = 0; i < iterations; ++i) {
-
-		uint32_t loaded = atomic_flag;
-		UNUSED(loaded);
-
-		atomic_flag++;
-	}
-}
-
-uint64_t benchmark(double factor)
-{
-	uint64_t start, end;
-	uint64_t elapsed_single, elapsed_multithreaded, elapsed_atomic_reads_writes;
-
-	std::thread threads[num_treads];
-	shared_type shared_variable { 0 };
-
-	// multithreaded benchmarks
-	start = rdtscp();
-
-	for (int i = 0; i < num_treads; i++)
-		threads[i] = std::thread(increment_multithreaded, std::ref(shared_variable), iterations / num_treads, i);
-
-	for (int i = 0; i < num_treads; i++)
-		threads[i].join();
-
-	end = rdtscp();
-	elapsed_multithreaded = tsc_to_ns(end - start, factor);
-
-	// single threaded increments
-	start = rdtscp();
-	increment_single_thread(shared_variable, iterations);
-	end = rdtscp();
-	elapsed_single = tsc_to_ns(end - start, factor);
-
-	// emulating N volatile atomic read/writes
-	start = rdtscp();
-	emulate_atomic_reads_writes(iterations);
-	end = rdtscp();
-	elapsed_atomic_reads_writes = tsc_to_ns(end - start, factor);
-
-	return (elapsed_multithreaded - elapsed_single - elapsed_atomic_reads_writes) / iterations;
+	std::sort(samples.begin(), samples.end());
+	std::cout << "Median value is: " << tsc2ns(samples[samples.size() / 2]) << std::endl;
 }
 
 int main()
 {
-	constexpr uint64_t benchmark_iterations = 10;
-	double factor = get_tsc_to_ns_factor();
-
-	std::vector<uint64_t> results;
-	for (uint64_t i = 0; i < benchmark_iterations; ++i) {
-		results.push_back(benchmark(factor));
-	}
-
-	std::sort(results.begin(), results.end());
-
-	auto Q1 = results.begin() + results.size() / 4;
-	auto Q3 = results.end() - results.size() / 4;
-
-	std::cout << "\nThe Interquartile range is " << *Q3 - *Q1 << std::endl;
-	std::cout << "The Average of Interquartile range is " << std::accumulate(Q1, Q3, 0.0) / (Q3 - Q1) << std::endl;
+	benchmark();
 }
